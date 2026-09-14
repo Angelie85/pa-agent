@@ -6,7 +6,7 @@
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch --env-file=.env src/index.js",
-    "start": "node --env-file=.env src/index.js"
+    "start": "node --env-file-if-exists=.env src/index.js"
   },
   "engines": {
     "node": ">=20"
