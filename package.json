@@ -1,0 +1,22 @@
+{
+  "name": "personal-assistant",
+  "version": "0.1.0",
+  "description": "Personal assistant on Telegram — Claude + Google Calendar",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/index.js",
+    "start": "node --env-file=.env src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.0",
+    "googleapis": "^144.0.0",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

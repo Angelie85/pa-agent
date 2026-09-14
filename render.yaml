@@ -1,0 +1,52 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: push this repo to GitHub, then in Render:
+#   New + → Blueprint → connect this repo → Render reads render.yaml
+#   You'll be prompted for each `sync: false` secret at deploy time.
+
+services:
+  - type: web
+    name: telegram-assistant
+    runtime: node
+    plan: starter        # $7/mo, always-on
+    region: virginia
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+
+    # Persistent disk for SQLite (tasks + Google OAuth tokens).
+    disk:
+      name: assistant-data
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      # --- Non-secret config ---
+      - key: NODE_VERSION
+        value: "20"
+      - key: DATA_DIR
+        value: /var/data
+      - key: PORT
+        value: "3000"
+      - key: TIMEZONE
+        value: America/New_York
+      - key: USER_NAME
+        value: Angelie
+      - key: MORNING_BRIEF_CRON
+        value: 0 8 * * 1-5
+
+      # --- Secrets (prompted at deploy time) ---
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_AUTHORIZED_USER_IDS
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      # Set this AFTER first deploy — it needs your Render URL:
+      # https://<service-name>.onrender.com/oauth/callback
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
