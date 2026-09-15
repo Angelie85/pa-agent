@@ -4,6 +4,7 @@ import TelegramBot from "node-telegram-bot-api";
 import Anthropic from "@anthropic-ai/sdk";
 import { tools, dispatchTool } from "./tools.js";
 import { getAuthUrl, handleOAuthCallback, isAuthorized } from "./google.js";
+import { getDueReminders, markReminderFired } from "./store.js";
 
 const app = express();
 
@@ -12,7 +13,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // Long polling — no webhook, no public URL needed for messaging.
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-const MODEL = "claude-sonnet-5";
+const MODEL = "claude-haiku-4-5";
 const MAX_TOOL_TURNS = 10;
 const HISTORY_LIMIT = 30;
 const TIMEZONE = process.env.TIMEZONE || "America/New_York";
@@ -29,13 +30,43 @@ const AUTHORIZED_USER_IDS = new Set(
 // Per-user conversation history (in-memory; move to store.js for persistence across restarts)
 const conversations = new Map();
 
-function systemPrompt() {
+function localIsoNow(tz) {
   const now = new Date();
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    })
+      .formatToParts(now)
+      .map((p) => [p.type, p.value]),
+  );
+  // "24" for midnight → normalize to "00"
+  const hour = parts.hour === "24" ? "00" : parts.hour;
+  const asIfUtc = new Date(
+    `${parts.year}-${parts.month}-${parts.day}T${hour}:${parts.minute}:${parts.second}Z`,
+  );
+  const offsetMin = Math.round((asIfUtc.getTime() - now.getTime()) / 60000);
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const offH = String(Math.floor(abs / 60)).padStart(2, "0");
+  const offM = String(abs % 60).padStart(2, "0");
+  return `${parts.year}-${parts.month}-${parts.day}T${hour}:${parts.minute}:${parts.second}${sign}${offH}:${offM}`;
+}
+
+function systemPrompt() {
+  const nowLocal = localIsoNow(TIMEZONE);
   return `You are ${USER_NAME}'s personal assistant, reachable via Telegram.
 
 Current context:
 - Timezone: ${TIMEZONE}
-- Now: ${now.toISOString()} (${now.toLocaleString("en-US", { timeZone: TIMEZONE })})
+- Current local time: ${nowLocal}
+- IMPORTANT: When producing ISO 8601 datetimes for tools, use the local time above as your reference and keep the timezone offset it shows. Do NOT mix the local wall-clock time with a UTC "Z" suffix — that will be wrong by the offset amount.
 
 Style:
 - Warm, concise, casual — like a smart friend, not a corporate bot.
@@ -61,12 +92,18 @@ Email quality:
 Tools:
 - When she gives vague times ("tomorrow at 3", "next Wed morning"), resolve them to concrete ISO 8601 datetimes in her timezone before calling calendar tools.
 - For "what's on today", use the local day boundaries (start of day → end of day) in her timezone.
-- After using tools, summarize the result in a friendly line — don't dump raw JSON.`;
+- After using tools, summarize the result in a friendly line — don't dump raw JSON.
+
+Reminders:
+- "Remind me to X at Y" / "in Z minutes" → schedule_reminder with a concrete ISO 8601 fire_at (include the timezone offset). The message should be the nudge itself, short and imperative ("Call Sam", not "Reminder: to call Sam").
+- Use reminders for time-based nudges over Telegram. Use add_task for open-ended to-dos with no fire time, and create_event for things that need a calendar block.`;
 }
 
-export async function chat(userKey, userText) {
+export async function chat(userKey, userText, { userId } = {}) {
   const history = conversations.get(userKey) ?? [];
   history.push({ role: "user", content: userText });
+
+  const toolContext = { userId: userId ?? userKey };
 
   let finalText = "";
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
@@ -86,7 +123,9 @@ export async function chat(userKey, userText) {
         toolUses.map(async (tu) => ({
           type: "tool_result",
           tool_use_id: tu.id,
-          content: JSON.stringify(await dispatchTool(tu.name, tu.input)),
+          content: JSON.stringify(
+            await dispatchTool(tu.name, tu.input, toolContext),
+          ),
         })),
       );
       history.push({ role: "user", content: toolResults });
@@ -192,6 +231,29 @@ if (morningTarget) {
     "Morning brief disabled (set TELEGRAM_AUTHORIZED_USER_IDS to enable)",
   );
 }
+
+// --- Reminder poller ---
+const REMINDER_POLL_MS = Number(process.env.REMINDER_POLL_MS) || 30_000;
+
+async function fireDueReminders() {
+  const due = getDueReminders(new Date().toISOString());
+  for (const r of due) {
+    try {
+      await sendTelegram(r.user_id, `⏰ ${r.message}`);
+      markReminderFired(r.id);
+    } catch (err) {
+      console.error(`Failed to send reminder ${r.id}:`, err.message);
+      // Leave fired=0 so we retry on the next tick.
+    }
+  }
+}
+
+setInterval(() => {
+  fireDueReminders().catch((err) =>
+    console.error("Reminder poll failed:", err),
+  );
+}, REMINDER_POLL_MS);
+console.log(`Reminder poller running every ${REMINDER_POLL_MS}ms`);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

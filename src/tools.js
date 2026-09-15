@@ -1,5 +1,13 @@
 import { calendar, gmail } from './google.js';
-import { addTask, listTasks, completeTask, deleteTask } from './store.js';
+import {
+  addTask,
+  listTasks,
+  completeTask,
+  deleteTask,
+  addReminder,
+  listReminders,
+  deleteReminder,
+} from './store.js';
 
 const TIMEZONE = process.env.TIMEZONE || 'America/New_York';
 
@@ -85,6 +93,47 @@ export const tools = [
   {
     name: 'delete_task',
     description: 'Delete a task by its numeric ID. Confirm before calling.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer' },
+      },
+      required: ['id'],
+    },
+  },
+
+  // --- Reminders ---
+  {
+    name: 'schedule_reminder',
+    description:
+      'Schedule a Telegram reminder to be sent to the user at a specific time. Resolve vague times ("in 20 min", "tomorrow 9am") to a concrete ISO 8601 datetime with timezone offset first. The message should be short and phrased as a nudge (e.g. "Call Sam" not "Reminder: to call Sam").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'The reminder text to send' },
+        fire_at: {
+          type: 'string',
+          description:
+            'ISO 8601 datetime with timezone offset when the reminder should fire. e.g. 2026-09-14T15:00:00-04:00',
+        },
+      },
+      required: ['message', 'fire_at'],
+    },
+  },
+  {
+    name: 'list_reminders',
+    description:
+      'List the current user\'s pending reminders (not yet fired). Set include_fired=true to include past ones.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        include_fired: { type: 'boolean', default: false },
+      },
+    },
+  },
+  {
+    name: 'delete_reminder',
+    description: 'Cancel a pending reminder by its numeric ID. Confirm before calling.',
     input_schema: {
       type: 'object',
       properties: {
@@ -232,6 +281,38 @@ const handlers = {
     return row ?? { error: `No task with id ${id}` };
   },
 
+  // --- Reminder handlers ---
+  async schedule_reminder({ message, fire_at }, { userId } = {}) {
+    if (!userId) return { error: 'No user context — cannot schedule reminder' };
+    const when = new Date(fire_at);
+    if (Number.isNaN(when.getTime())) {
+      return { error: `Invalid fire_at: ${fire_at}` };
+    }
+    if (when.getTime() <= Date.now()) {
+      return { error: 'fire_at must be in the future' };
+    }
+    const row = addReminder({
+      userId,
+      message,
+      fireAt: when.toISOString(),
+    });
+    return {
+      id: row.id,
+      message: row.message,
+      fire_at: row.fire_at,
+    };
+  },
+
+  async list_reminders({ include_fired = false } = {}, { userId } = {}) {
+    if (!userId) return { error: 'No user context' };
+    return listReminders({ userId, includeFired: include_fired });
+  },
+
+  async delete_reminder({ id }) {
+    const row = deleteReminder(id);
+    return row ?? { error: `No reminder with id ${id}` };
+  },
+
   // --- Gmail handlers ---
   async search_gmail({ query, max_results = 10 }) {
     const g = gmail();
@@ -362,11 +443,11 @@ function extractBody(payload) {
   return '';
 }
 
-export async function dispatchTool(name, input) {
+export async function dispatchTool(name, input, context = {}) {
   const fn = handlers[name];
   if (!fn) return { error: `Unknown tool: ${name}` };
   try {
-    return await fn(input);
+    return await fn(input, context);
   } catch (err) {
     console.error(`Tool ${name} failed:`, err);
     return { error: err.message };
