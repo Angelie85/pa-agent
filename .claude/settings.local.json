@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check src/index.js)",
+      "Bash(node -e \"import\\('openai'\\).then\\(m => console.log\\('openai import OK:', typeof m.default\\)\\)\")"
+    ]
+  }
+}

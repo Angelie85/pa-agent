@@ -2,22 +2,70 @@ import express from "express";
 import cron from "node-cron";
 import TelegramBot from "node-telegram-bot-api";
 import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { tools, dispatchTool } from "./tools.js";
 import { getAuthUrl, handleOAuthCallback, isAuthorized } from "./google.js";
 import { getDueReminders, markReminderFired } from "./store.js";
 
 const app = express();
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Pick LLM provider at boot. One of: "openai" (default), "anthropic", "openrouter", "deepseek".
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || "openai").toLowerCase();
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+// OpenRouter models are namespaced "<provider>/<model>" — see https://openrouter.ai/models
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-5-nano";
+// DeepSeek models: "deepseek-chat" (V3) or "deepseek-reasoner" (R1)
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+
+const anthropic =
+  LLM_PROVIDER === "anthropic"
+    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+    : null;
+
+// OpenRouter and DeepSeek both speak the OpenAI Chat Completions API — we reuse the OpenAI SDK
+// and just point at a different baseURL. `openaiClient` is whichever one is active.
+let openaiClient = null;
+let openaiModel = OPENAI_MODEL;
+if (LLM_PROVIDER === "openai") {
+  openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  openaiModel = OPENAI_MODEL;
+} else if (LLM_PROVIDER === "openrouter") {
+  openaiClient = new OpenAI({
+    apiKey: process.env.OPENROUTER_API_KEY,
+    baseURL: "https://openrouter.ai/api/v1",
+    defaultHeaders: {
+      "HTTP-Referer":
+        process.env.OPENROUTER_SITE_URL || "http://localhost:3000",
+      "X-Title": process.env.OPENROUTER_APP_NAME || "PA Assistant",
+    },
+  });
+  openaiModel = OPENROUTER_MODEL;
+} else if (LLM_PROVIDER === "deepseek") {
+  openaiClient = new OpenAI({
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    baseURL: "https://api.deepseek.com/v1",
+  });
+  openaiModel = DEEPSEEK_MODEL;
+}
 
 // Long polling — no webhook, no public URL needed for messaging.
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 
-const MODEL = "claude-haiku-4-5";
 const MAX_TOOL_TURNS = 10;
 const HISTORY_LIMIT = 30;
 const TIMEZONE = process.env.TIMEZONE || "America/New_York";
 const USER_NAME = process.env.USER_NAME || "the user";
+
+// OpenAI expects tools in { type: "function", function: { name, description, parameters } } form.
+const openaiTools = tools.map((t) => ({
+  type: "function",
+  function: {
+    name: t.name,
+    description: t.description,
+    parameters: t.input_schema,
+  },
+}));
 
 // Comma-separated list of Telegram user IDs allowed to talk to the bot
 const AUTHORIZED_USER_IDS = new Set(
@@ -101,14 +149,30 @@ Reminders:
 
 export async function chat(userKey, userText, { userId } = {}) {
   const history = conversations.get(userKey) ?? [];
-  history.push({ role: "user", content: userText });
-
   const toolContext = { userId: userId ?? userKey };
+
+  const finalText =
+    LLM_PROVIDER === "anthropic"
+      ? await chatAnthropic(history, userText, toolContext)
+      : await chatOpenAI(history, userText, toolContext);
+
+  if (history.length > HISTORY_LIMIT) {
+    history.splice(0, history.length - HISTORY_LIMIT);
+  }
+  conversations.set(userKey, history);
+
+  return (
+    finalText || "(no response — model may have hit the tool-use turn cap)"
+  );
+}
+
+async function chatAnthropic(history, userText, toolContext) {
+  history.push({ role: "user", content: userText });
 
   let finalText = "";
   for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens: 1024,
       system: systemPrompt(),
       tools,
@@ -139,15 +203,66 @@ export async function chat(userKey, userText, { userId } = {}) {
       .trim();
     break;
   }
+  return finalText;
+}
 
-  if (history.length > HISTORY_LIMIT) {
-    history.splice(0, history.length - HISTORY_LIMIT);
+async function chatOpenAI(history, userText, toolContext) {
+  history.push({ role: "user", content: userText });
+
+  let finalText = "";
+  for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+    const response = await openaiClient.chat.completions.create({
+      model: openaiModel,
+      messages: [{ role: "system", content: systemPrompt() }, ...history],
+      tools: openaiTools,
+    });
+
+    const msg = response.choices[0].message;
+    // Persist the assistant turn exactly as OpenAI returned it (tool_calls included).
+    history.push({
+      role: "assistant",
+      content: msg.content ?? "",
+      ...(msg.tool_calls ? { tool_calls: msg.tool_calls } : {}),
+    });
+
+    if (msg.tool_calls?.length) {
+      const results = await Promise.all(
+        msg.tool_calls.map(async (tc) => {
+          let args = {};
+          try {
+            args = tc.function.arguments
+              ? JSON.parse(tc.function.arguments)
+              : {};
+          } catch (err) {
+            return {
+              tool_call_id: tc.id,
+              content: JSON.stringify({
+                error: `Invalid JSON arguments: ${err.message}`,
+              }),
+            };
+          }
+          const result = await dispatchTool(
+            tc.function.name,
+            args,
+            toolContext,
+          );
+          return { tool_call_id: tc.id, content: JSON.stringify(result) };
+        }),
+      );
+      for (const r of results) {
+        history.push({
+          role: "tool",
+          tool_call_id: r.tool_call_id,
+          content: r.content,
+        });
+      }
+      continue;
+    }
+
+    finalText = (msg.content ?? "").trim();
+    break;
   }
-  conversations.set(userKey, history);
-
-  return (
-    finalText || "(no response — Claude may have hit the tool-use turn cap)"
-  );
+  return finalText;
 }
 
 export async function sendTelegram(chatId, text) {
